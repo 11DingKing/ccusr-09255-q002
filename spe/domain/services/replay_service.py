@@ -57,8 +57,10 @@ def replay_session(
     for hb in sorted(heartbeats, key=lambda h: h.seq):
         if hb.seq <= last_seq:
             continue  # stale / duplicate / out-of-order
-        proposed = max(0, min(hb.watched_seconds_total - marker, max_gap_seconds))
-        marker = max(marker, hb.watched_seconds_total)
+        if hb.watched_seconds_total < marker:
+            continue  # cumulative regression: rejected at ingest, never settles
+        proposed = min(hb.watched_seconds_total - marker, max_gap_seconds)
+        marker = hb.watched_seconds_total
         last_seq = hb.seq
 
         credited = 0

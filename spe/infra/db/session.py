@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
+from sqlalchemy import event
+from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -23,9 +25,21 @@ def make_engine(database_url: str, echo: bool = False) -> AsyncEngine:
             # Share one in-memory connection across all sessions so schema and
             # data persist for the lifetime of the engine (used by tests).
             kwargs["poolclass"] = StaticPool
-    return create_async_engine(
+    engine = create_async_engine(
         database_url, echo=echo, future=True, connect_args=connect_args, **kwargs
     )
+    if database_url.startswith("sqlite"):
+        # SQLite takes its write lock lazily at the first DML statement, so two
+        # concurrent heartbeat transactions could both read a stale session
+        # cursor and then double-credit the daily ledger. BEGIN IMMEDIATE
+        # acquires the reserved lock up front: writers serialise (waiting out
+        # the driver busy timeout) and every transaction reads the latest
+        # committed state.
+        @event.listens_for(engine.sync_engine, "begin")
+        def _begin_immediate(conn: Connection) -> None:
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
+
+    return engine
 
 
 def make_session_factory(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:

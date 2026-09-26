@@ -130,31 +130,71 @@ class SessionService:
         if session.status is not SessionStatus.ACTIVE:
             return ActionResult.rejected(ReasonCode.REJECTED_SESSION_NOT_ACTIVE, session=session)
 
-        # Idempotent / ordered guard.
+        # Joint ordering guard: the sequence cursor and the cumulative marker
+        # are validated together, and either both advance or neither does.
         if seq <= session.last_seq:
+            # Stale or duplicate delivery: already covered by the cursor.
             return ActionResult.rejected(
                 ReasonCode.HEARTBEAT_IGNORED_STALE,
                 session=session,
                 received_seq=seq,
                 last_seq=session.last_seq,
             )
+        if watched_seconds_total < session.watched_seconds_marker:
+            # Cumulative regression (e.g. a reinstalled client whose counter
+            # restarted from zero while keeping its sequence): reject without
+            # advancing the cursor, recording the beat, or emitting a success
+            # event, so a later legitimate heartbeat still settles against the
+            # original baseline.
+            return ActionResult.rejected(
+                ReasonCode.HEARTBEAT_IGNORED_REGRESSION,
+                session=session,
+                received_seq=seq,
+                last_seq=session.last_seq,
+                watched_seconds_total=watched_seconds_total,
+                watched_seconds_marker=session.watched_seconds_marker,
+            )
 
         now = self._clock.now()
+
+        if watched_seconds_total == session.watched_seconds_marker:
+            # In-order heartbeat with no new watch time. Distinct from a
+            # duplicate (seq not covered by the cursor): advance the cursor to
+            # keep the sequence monotonic, credit nothing.
+            session.last_seq = seq
+            session.updated_at = now
+            if self._heartbeats is not None:
+                await self._heartbeats.record(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    seq=seq,
+                    watched_seconds_total=watched_seconds_total,
+                    credited_seconds=0,
+                    occurred_at=now,
+                )
+            await self._sessions.save(session)
+            await self._emit("session.heartbeat", session, now, credited_seconds=0)
+            return ActionResult.success(
+                ReasonCode.HEARTBEAT_APPLIED_NO_PROGRESS,
+                session=session,
+                credited_seconds=0,
+                per_day={},
+            )
+
         policy = await self._policies.get_by_id(tenant_id, session.policy_id)
         assert policy is not None  # pinned policy must exist
         tz = policy.document.rules.timezone
 
-        proposed = max(
-            0, min(watched_seconds_total - session.watched_seconds_marker, self._max_gap)
-        )
+        proposed = min(watched_seconds_total - session.watched_seconds_marker, self._max_gap)
 
         credited, per_day, hit_limit, limit_reason = await self._credit(
             session, policy.document, tz, now, proposed
         )
 
         # Advance the marker/seq regardless of how much was creditable, so the
-        # cumulative accounting stays monotonic and idempotent.
-        session.watched_seconds_marker = max(session.watched_seconds_marker, watched_seconds_total)
+        # cumulative accounting stays monotonic and idempotent. The guards
+        # above guarantee watched_seconds_total > watched_seconds_marker here.
+        session.watched_seconds_marker = watched_seconds_total
         session.last_seq = seq
         session.updated_at = now
 
