@@ -43,6 +43,10 @@ class ReasonCode(StrEnum):
     HEARTBEAT_IGNORED_STALE = "HEARTBEAT_IGNORED_STALE"
     """A duplicate or out-of-order heartbeat was ignored (no double counting)."""
 
+    HEARTBEAT_IGNORED_REGRESSION = "HEARTBEAT_IGNORED_REGRESSION"
+    """A heartbeat whose cumulative counter regressed (e.g. client reinstall)
+    was ignored; the session cursor stays on the previous baseline."""
+
     SESSION_PAUSED = "SESSION_PAUSED"
     """The session transitioned to the paused state."""
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -173,6 +173,34 @@ class SqlSessionRepository:
         if idempotency_key is not None:
             model.idempotency_key = idempotency_key
         await self._db.flush()
+
+    async def save_if_cursor(
+        self, session: Session, *, expected_last_seq: int, expected_marker: int
+    ) -> bool:
+        # Atomic joint guard on the ordering cursor: the row is only updated if
+        # both last_seq and the cumulative marker still hold the values this
+        # request validated against. A concurrent heartbeat that committed in
+        # between makes the UPDATE match zero rows instead of silently
+        # overwriting accounting state (last-writer-wins).
+        stmt = (
+            update(SessionModel)
+            .where(
+                SessionModel.tenant_id == session.tenant_id,
+                SessionModel.id == session.id,
+                SessionModel.last_seq == expected_last_seq,
+                SessionModel.watched_seconds_marker == expected_marker,
+            )
+            .values(
+                status=session.status.value,
+                updated_at=session.updated_at,
+                ended_at=session.ended_at,
+                last_seq=session.last_seq,
+                watched_seconds_marker=session.watched_seconds_marker,
+                total_watched_seconds=session.total_watched_seconds,
+            )
+        )
+        result = await self._db.execute(stmt)
+        return result.rowcount == 1
 
 
 class SqlDailyUsageLedger:

@@ -69,6 +69,12 @@ class SessionRepository(Protocol):
 
     async def save(self, session: Session, idempotency_key: str | None = None) -> None: ...
 
+    async def save_if_cursor(
+        self, session: Session, *, expected_last_seq: int, expected_marker: int
+    ) -> bool:
+        """执行确定性的业务处理。"""
+        ...
+
 
 class DailyUsageLedger(Protocol):
     """封装领域状态与业务约束。"""

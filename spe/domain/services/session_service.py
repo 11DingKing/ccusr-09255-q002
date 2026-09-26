@@ -39,6 +39,7 @@ class SessionService:
         ledger: DailyUsageLedger,
         heartbeats: HeartbeatSink | None = None,
         heartbeat_max_gap_seconds: int = 90,
+        heartbeat_max_attempts: int = 10,
     ) -> None:
         self._sessions = sessions
         self._policies = policies
@@ -48,6 +49,7 @@ class SessionService:
         self._ledger = ledger
         self._heartbeats = heartbeats
         self._max_gap = heartbeat_max_gap_seconds
+        self._max_attempts = heartbeat_max_attempts
 
     # -- start ---------------------------------------------------------------
 
@@ -122,6 +124,33 @@ class SessionService:
         watched_seconds_total: int,
     ) -> ActionResult:
         """执行确定性的业务处理。"""
+        # A lost cursor race is retried against the freshly committed state so
+        # concurrent heartbeats serialise instead of being dropped; every other
+        # outcome is final on the first attempt.
+        for _ in range(self._max_attempts):
+            result = await self._settle_heartbeat(
+                tenant_id, session_id, seq, watched_seconds_total
+            )
+            if result is not None:
+                return result
+        # Contention did not resolve within the attempt budget: report the beat
+        # as stale so the caller retries against the committed cursor.
+        session = await self._sessions.get(tenant_id, session_id)
+        return ActionResult.rejected(
+            ReasonCode.HEARTBEAT_IGNORED_STALE,
+            session=session,
+            received_seq=seq,
+            last_seq=session.last_seq if session is not None else None,
+        )
+
+    async def _settle_heartbeat(
+        self,
+        tenant_id: str,
+        session_id: str,
+        seq: int,
+        watched_seconds_total: int,
+    ) -> ActionResult | None:
+        """执行确定性的业务处理。"""
         session = await self._sessions.get_for_update(tenant_id, session_id)
         if session is None:
             return ActionResult.rejected(ReasonCode.REJECTED_SESSION_NOT_FOUND)
@@ -130,7 +159,7 @@ class SessionService:
         if session.status is not SessionStatus.ACTIVE:
             return ActionResult.rejected(ReasonCode.REJECTED_SESSION_NOT_ACTIVE, session=session)
 
-        # Idempotent / ordered guard.
+        # Ordered guard: duplicate or out-of-order delivery.
         if seq <= session.last_seq:
             return ActionResult.rejected(
                 ReasonCode.HEARTBEAT_IGNORED_STALE,
@@ -139,24 +168,64 @@ class SessionService:
                 last_seq=session.last_seq,
             )
 
+        # Cumulative guard: a reinstalled/reset client can pair a fresh seq with
+        # a smaller cumulative counter. Accepting it would advance last_seq and
+        # strand the still-valid baseline, so the heartbeat is rejected without
+        # touching anything — no cursor move, no ledger entry, no heartbeat
+        # record, no outbox event. Later legitimate heartbeats still settle
+        # against the preserved baseline.
+        if watched_seconds_total < session.watched_seconds_marker:
+            return ActionResult.rejected(
+                ReasonCode.HEARTBEAT_IGNORED_REGRESSION,
+                session=session,
+                received_seq=seq,
+                last_seq=session.last_seq,
+                received_total=watched_seconds_total,
+                watched_seconds_marker=session.watched_seconds_marker,
+            )
+
         now = self._clock.now()
         policy = await self._policies.get_by_id(tenant_id, session.policy_id)
         assert policy is not None  # pinned policy must exist
         tz = policy.document.rules.timezone
 
-        proposed = max(
-            0, min(watched_seconds_total - session.watched_seconds_marker, self._max_gap)
-        )
+        # Non-negative by the cumulative guard above; capped to bound a single
+        # heartbeat's claim. A zero delta is a genuine no-increment heartbeat:
+        # it is applied (cursor advances) with zero credit, distinct from a
+        # duplicate (HEARTBEAT_IGNORED_STALE) or a regression.
+        proposed = min(watched_seconds_total - session.watched_seconds_marker, self._max_gap)
 
-        credited, per_day, hit_limit, limit_reason = await self._credit(
+        credited, per_day, hit_limit, limit_reason = await self._plan_credit(
             session, policy.document, tz, now, proposed
         )
 
         # Advance the marker/seq regardless of how much was creditable, so the
         # cumulative accounting stays monotonic and idempotent.
-        session.watched_seconds_marker = max(session.watched_seconds_marker, watched_seconds_total)
+        expected_last_seq = session.last_seq
+        expected_marker = session.watched_seconds_marker
         session.last_seq = seq
+        session.watched_seconds_marker = watched_seconds_total
+        session.total_watched_seconds += credited
         session.updated_at = now
+        if hit_limit:
+            session.status = SessionStatus.ENDED
+            session.ended_at = now
+
+        # Joint seq+marker check, applied atomically: the cursor only moves if
+        # no concurrent heartbeat committed since this session was loaded. The
+        # loser wrote nothing up to this point, so there is nothing to undo.
+        won = await self._sessions.save_if_cursor(
+            session,
+            expected_last_seq=expected_last_seq,
+            expected_marker=expected_marker,
+        )
+        if not won:
+            return None  # lost a concurrent race; caller retries on fresh state
+
+        # Cursor won: apply the planned side effects. Ledger, heartbeat record
+        # and outbox event share this request's transaction and commit together.
+        for day, seconds in per_day.items():
+            await self._ledger.add_seconds(tenant_id, session.user_id, day, seconds)
 
         if self._heartbeats is not None:
             await self._heartbeats.record(
@@ -169,9 +238,6 @@ class SessionService:
             )
 
         if hit_limit:
-            session.status = SessionStatus.ENDED
-            session.ended_at = now
-            await self._sessions.save(session)
             await self._emit("session.ended", session, now, cause=limit_reason)
             return ActionResult.rejected(
                 ReasonCode.SESSION_ENDED_BY_LIMIT,
@@ -181,7 +247,6 @@ class SessionService:
                 limit_reason=limit_reason,
             )
 
-        await self._sessions.save(session)
         await self._emit("session.heartbeat", session, now, credited_seconds=credited)
         return ActionResult.success(
             ReasonCode.HEARTBEAT_APPLIED,
@@ -190,7 +255,7 @@ class SessionService:
             per_day=per_day,
         )
 
-    async def _credit(
+    async def _plan_credit(
         self,
         session: Session,
         document: PolicyDocument,
@@ -234,8 +299,6 @@ class SessionService:
                     limit_reason = ReasonCode.DENIED_DAILY_LIMIT_REACHED.value
 
             if allow > 0:
-                await self._ledger.add_seconds(session.tenant_id, session.user_id, day, allow)
-                session.total_watched_seconds += allow
                 credited += allow
                 per_day[day] = per_day.get(day, 0) + allow
 
